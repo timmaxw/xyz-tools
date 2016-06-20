@@ -75,14 +75,6 @@ class Printer(object):
         if self.debug:
             print(*args, file=sys.stderr)
 
-    def _bad_reply(self, msg):
-        if self.debug:
-            raise PrinterError("Error communicating with printer: " + msg)
-        else:
-            raise PrinterError("Error communicating with printer: the printer "
-                "did something we don't know how to interpret. Use debug mode "
-                "to see more information.")
-
     def _write(self, buf):
         """Sends the contents of 'buf' to the printer."""
         self._debug_print("Send:", repr(buf).lstrip('b'))
@@ -130,7 +122,11 @@ class Printer(object):
                 return self._readline(pattern, optional)
             if optional:
                 return None
-            self._bad_reply("Expected {!r}".format(pattern))
+            raise PrinterError("Expected something matching the pattern {!r}, "
+                "but got {!r}. This is because the printer sent something that "
+                "this script doesn't understand, and this script errs on the "
+                "side of bailing out if that happens.".format(
+                    pattern, self._current_line[:-1]))
         self._current_line = None
         return match
 
