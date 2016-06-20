@@ -1,0 +1,410 @@
+#!/usr/bin/env python
+from __future__ import division, print_function
+import argparse, io, re, serial, six, struct, sys
+
+# The protocols in this file were discovered by sniffing the serial traffic
+# between the printer driver and the printer. The original reverse engineering
+# work was done by Github user tbirdsaw; his work can be found at
+# <https://github.com/tbirdsaw/xyz-tools>. Github user timmaxw cleaned up the
+# code and figured out how a few more parts of the protocol worked. There are
+# still many parts of the protocol that are poorly understood, but it works well
+# enough to print G-code files.
+
+# This script is designed to work under both Python 2.7 and Python 3.
+
+class PrinterError(Exception):
+    pass
+
+CMD_MACHINE_INFO = b'XYZ_@3D:'
+CMD_SEND_FIRMWARE = CMD_MACHINE_INFO + b'3'
+CMD_SEND_FILE = CMD_MACHINE_INFO + b'4'
+CMD_MACHINE_LIFE = CMD_MACHINE_INFO + b'5'
+CMD_FILAMENT1_INFO = CMD_MACHINE_INFO + b'6'
+CMD_FILAMENT2_INFO = CMD_MACHINE_INFO + b'7'
+CMD_STATUS_INFO = CMD_MACHINE_INFO + b'8'
+
+class Printer(object):
+    """Represents a XYZprinting da Vinci 3D printer that we are currently
+    connected to via the serial port."""
+
+    def __init__(self, port, debug = False):
+        self._sport = serial.Serial(
+            port,
+            baudrate = 115200,
+            xonxoff = 1,
+            bytesize = serial.EIGHTBITS,
+            parity = serial.PARITY_NONE,
+            timeout = 0.1,
+            writeTimeout = 1.0)
+
+        self.debug = debug
+
+        # If there's anything still in the serial buffer from previous runs of
+        # the program, delete it
+        self._sport.flushInput()
+        self._sport.flushOutput()
+        self._sport.timeout = 0.01
+        discarded = b''
+        while True:
+            byte = self._sport.read(1)
+            if not byte:
+                break
+            discarded += byte
+        if discarded:
+            self._debug_print("Discard:", repr(discarded).lstrip('b'))
+        self._sport.timeout = 1.0
+
+        self._current_line = None
+
+        self._write(CMD_MACHINE_INFO)
+        self._readline(b"XYZ_@3D:start")
+
+        self.info = {}
+        # I don't know what "MDU" means
+        self._readline(b"MDU:([a-zA-Z0-9]+)")
+        match = self._readline(b"FW_V:([0-9.]+)")
+        self.info["firmware_version"] = match.group(1).decode("utf8")
+        match = self._readline(b"MCH_ID:([A-Z0-9]+)")
+        self.info["serial_number"] = match.group(1).decode("utf8")
+        self._readline(b"PROTOCOL:2")
+
+    def close(self):
+        self._sport.close()
+
+    def _debug_print(self, *args):
+        if self.debug:
+            print(*args, file=sys.stderr)
+
+    def _bad_reply(self, msg):
+        if self.debug:
+            raise PrinterError("Error communicating with printer: " + msg)
+        else:
+            raise PrinterError("Error communicating with printer: the printer "
+                "did something we don't know how to interpret. Use debug mode "
+                "to see more information.")
+
+    def _write(self, buf):
+        """Sends the contents of 'buf' to the printer."""
+        self._debug_print("Send:", repr(buf).lstrip('b'))
+        try:
+            self._sport.write(buf)
+            self._sport.flush()
+        except serial.serialutil.SerialTimeoutException:
+            # I've found that this error is rarely recoverable except by power
+            # cycling.
+            raise PrinterError("Error communicating with printer: Write "
+                "operation timed out. Try power-cycling the printer.")
+
+    def _readline(self, pattern, optional = False):
+        """Reads a line from the printer and matches it against the regular
+        expression "pattern". If it matches, returns the match object. If not,
+        throws an exception.
+
+        If "optional" is set to True, returns None instead of throwing an
+        exception if the match fails. In this case the line will be stored and
+        we'll try it again the next time "_readline()" is called."""
+        if self._current_line is None:
+            self._current_line = b''
+            while True:
+                byte = self._sport.read(1)
+                if not byte:
+                    break
+                self._current_line += byte
+                if byte == b'\n':
+                    break
+                if len(self._current_line) > 1000:
+                    break
+            self._debug_print("Recv:", repr(self._current_line).lstrip('b'))
+            if not self._current_line.endswith(b'\n'):
+                if optional:
+                    self._current_line = None
+                    return None
+                raise PrinterError("Error communicating with printer: The "
+                    "printer didn't send any response.")
+        match = re.match(pattern, self._current_line[:-1])
+        if not match:
+            # Sometimes the printer inserts PRN_STATE in between other
+            # responses. Ignore it if we weren't looking for it.
+            if re.match(b"PRN_STATE:(\\d+)", self._current_line[:-1]):
+                self._current_line = None
+                return self._readline(pattern, optional)
+            if optional:
+                return None
+            self._bad_reply("Expected {!r}".format(pattern))
+        self._current_line = None
+        return match
+
+    def query_life(self):
+        """Queries the printer about its lifetime and returns the results as a
+        dict."""
+        info = {}
+        self._write(CMD_MACHINE_LIFE)
+
+        # I don't know what "MCHLIFE" means
+        self._readline(b"MCHLIFE:(\\d+)")
+
+        # "MCHEXDUR_LIFE" seems to correspond to the "LIFETIME" reported in the
+        # printer statistics on the LCD display, measured in minutes
+        match = self._readline(b"MCHEXDUR_LIFE:(\\d+)")
+        info["lifetime_minutes"] = int(match.group(1))
+
+        return info
+
+    def query_filament(self):
+        """Queries the printer about its filament cartridge and returns the
+        results as a dict."""
+        info = {}
+        self._write(CMD_FILAMENT1_INFO)
+
+        match = self._readline(b"EE1:([0-9a-f]{2}),([0-9a-f]{2}),([0-9a-f]+),"
+            b"([0-9a-f]+),(\\d+),(\\d+),(\\d+),(\\d+),(\\d+),(\\d+),"
+            b"([0-9a-f]*),(\\d+)")
+        # Except for these fields, I don't know what any of these mean.
+        info["filament_length_mm"] = int(match.group(5))
+        info["filament_remaining_length_mm"] = int(match.group(6))
+        info["target_extruder_temp_celsius"] = int(match.group(7))
+        info["target_bed_temp_celsius"] = int(match.group(8))
+
+        # I don't know what exactly CMD_FILAMENT2_INFO does. Some of the
+        # information it returns seems to be the same as for filament 1; other
+        # fields are zero. However, when this command runs, it triggers a
+        # message "FILAMENT INSTALLED OK?" on the printer LCD. It also seems to
+        # cause glitches; print jobs may not work after this command has been
+        # run. To avoid this disruption, we don't run it.
+
+        # self._write(CMD_FILAMENT2_INFO)
+        # match = self._readline(b"EE2:([0-9a-f]{2}),([0-9a-f]{2}),([0-9a-f]+),"
+        #     "([0-9a-f]+),(\\d+),(\\d+),(\\d+),(\\d+),(\\d+),(\\d+),([0-9a-f]*),"
+        #     "(\\d+)")
+
+        return info
+
+    def query_status(self):
+        """Queries the printer about its current status and returns the results
+        as a dict."""
+        info = {}
+        self._write(CMD_STATUS_INFO)
+
+        # I think this was supposed to be "WORK_PERCENT".
+        match = self._readline(b"WORK_PARSENT:(\\d+)")
+        info["percent_complete"] = int(match.group(1))
+
+        match = self._readline(b"WORK_TIME:(\\d+)")
+        info["work_time_mins"] = int(match.group(1))
+
+        match = self._readline(b"EST_TIME:(\\d+)")
+        info["estimated_time_mins"] = int(match.group(1))
+
+        match = self._readline(b"ET0:(\\d+)")
+        info["extruder_temp_celsius"] = int(match.group(1))
+
+        match = self._readline(b"BT:(\\d+)")
+        info["bed_temp_celsius"] = int(match.group(1))
+
+        # "MCH_STATE" appears to describe the current state of the system.
+        # Values I have seen:
+        # "16" if a setting has recently been changed
+        # "26" if the printer is idle
+        # "27" if the printer is printing or cooling
+        self._readline(b"MCH_STATE:(\\d+)")
+
+        # "PRN_STATE" appears to describe the progress of the print job.
+        # Values I have seen:
+        # "1" when heating the print bed
+        # "2" in the main build phase
+        # "5" when cooling after a job
+        # "7" when lowering bed after a job
+        # "571449" on the "JOB CANCELLING COMPLETE" screen (this is probably a
+        #     glitch, but we interpret it anyway)
+        # Also, note that "PRN_STATE" seems to be absent when MCH_STATE is 26,
+        # and is sometimes also be absent when MCH_STATE is 27.
+        match = self._readline(b"PRN_STATE:(\\d+)", optional = True)
+        if match is None:
+            info["print_state"] = "idle"
+        else:
+            table = {
+                "1": "heating",
+                "2": "building",
+                "5": "cooling",
+                "7": "lowering_bed",
+                "571449": "complete"
+                }
+            info["print_state"] = table.get(
+                match.group(1),
+                "unknown({})".format(match.group(1)))
+
+        # I think 0 and 1 are the only possible values for LANG, because English
+        # and Japanese are the only two choices in the printer language list.
+        match = self._readline(b"LANG:(\\d+)")
+        info["language"] = {b'0': "English", b'1': "Japanese"}[match.group(1)]
+
+        return info
+
+    def send_gcode(self, file_path, progress_callback = None):
+        """Sends the contents of the G-code file located at "file_path" to the
+        printer. Returns once the G-code has all been transmitted.
+
+        If "progress_callback" is provided, it should be a function that will be
+        called repeatedly two arguments; the first is the number of bytes
+        transmitted so far, and the second is the total number of bytes to be
+        transmitted."""
+
+        # The printer expects data as G-code with CRLF line endings, terminated
+        # by an additional CRLF. There is a checksum after every 10236-byte
+        # chunk of data, and another checksum at the very end.
+        bytes_per_chunk = 10236
+
+        # We perform two types of preprocessing on the G-code file before
+        # sending it to the printer:
+        # 1. Convert the newlines in the original file into CRLF-style newlines.
+        # 2. Cut out blank lines, which the printer would interpret as the end
+        #    of the file.
+
+        # Scan the gcode file to determine how long it will be after
+        # preprocessing. It's a shame that we have to read the file twice, but I
+        # don't see a better way...
+        with open(file_path, "rb") as file_obj:
+            file_len = 0
+            for line in file_obj:
+                line = line.strip(b'\r\n')
+                if not line:
+                    continue
+                file_len += len(line) + 2
+            file_len += 2   # For extra CRLF at the end
+
+        self._write(CMD_SEND_FILE)
+        try:
+            self._readline(b"OFFLINE_OK")
+        except PrinterError:
+            # This is a common error message, so we special-case it.
+            raise PrinterError("Printer doesn't seem to be ready for the next "
+                "job. Check what the LCD display says; you might need to press "
+                "the OK button.")
+
+        self._write(
+            b'M1:MyTest,'+
+            '{}'.format(file_len).encode("utf8")+
+            b',1.3.49,EE1_OK,EE2_OK')
+        match = self._readline(b"OFFLINE_OK")
+
+        with open(file_path, "rb") as file_obj:
+            # We'll send the data in chunks of 10236 bytes. Each chunk ends with
+            # a checksum. "chunk_progress" is the number of bytes we've sent so
+            # far in this chunk, and "checksum" is the checksum so far for this
+            # chunk.
+            chunk_progress = 0
+            checksum = 0
+
+            def send_checksum():
+                self._write(struct.pack('>i', checksum))
+                self._readline(b"CheckSumOK:PN:0")
+
+            # If the 10236-byte chunk ends in the middle of a 4096-byte block
+            # (which is usually the case) we'll put the rest of the block in
+            # "remainder" temporarily.
+            remainder = None
+
+            # "total_progress" is the number of bytes we've sent so far overall;
+            # we use this for progress reports.
+            total_progress = 0
+
+            eof = False
+            while True:
+                # Fetch the next line from the file or from "remainder"
+                if remainder is not None:
+                    next_line = remainder
+                elif eof:
+                    break
+                else:
+                    next_line = file_obj.readline()
+                    if not next_line:
+                        # We reached the end of the file. Send a final CRLF and
+                        # then break out of the loop
+                        eof = True
+                        next_line = b'\r\n'
+                    else:
+                        # Remove existing line terminator(s)
+                        next_line = next_line.strip(b'\r\n')
+
+                        if not next_line:
+                            # We found an empty line; skip it.
+                            continue
+
+                        # Add CRLF
+                        next_line += b'\r\n'
+
+                # If this line spans a chunk boundary, cut it in two and put
+                # the second part in "remainder"
+                if chunk_progress + len(next_line) > bytes_per_chunk:
+                    remainder = next_line[bytes_per_chunk-chunk_progress:]
+                    next_line = next_line[:bytes_per_chunk-chunk_progress]
+                else:
+                    remainder = None
+
+                # Send the block and compute the checksum
+                self._write(next_line)
+                chunk_progress += len(next_line)
+                checksum += sum(six.iterbytes(next_line))
+
+                # Update the progress indicator
+                total_progress += len(next_line)
+                progress_callback(total_progress, file_len)
+
+                # If we just completed a chunk, write a checksum
+                if chunk_progress == bytes_per_chunk:
+                    send_checksum()
+                    chunk_progress = 0
+                    checksum = 0
+
+            # Write the final checksum
+            if chunk_progress != 0:
+                send_checksum()
+
+            assert total_progress == file_len
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description = "Send a G-code file via USB to a XYZprinting da Vinci 3D "
+            "printer.")
+    group = parser.add_mutually_exclusive_group(required = True)
+    group.add_argument("gcode", metavar="model.gcode", nargs="?",
+        help = "path to the G-code file to send")
+    group.add_argument("--info", action="store_true", dest="info",
+        help = "query printer information instead of printing a G-code file")
+    default_port = "/dev/ttyACM0"
+    parser.add_argument("--port", default=default_port,
+        help = "serial port where the printer is located (default {})".format(
+            default_port))
+    parser.add_argument("--debug", action="store_true", dest="debug",
+        help = "print detailed debugging information")
+    args = parser.parse_args()
+
+    try:
+        printer = Printer(args.port, args.debug)
+
+        if args.info:
+            info = printer.info.copy()
+            info.update(printer.query_life())
+            info.update(printer.query_filament())
+            info.update(printer.query_status())
+            for key in sorted(info.keys()):
+                print(key, info[key])
+
+        else:
+            print("Sending", args.gcode, "to printer...", file=sys.stderr)
+            last_n = None
+            def progress_callback(num, denom):
+                global last_n
+                width = 50
+                n = (num * width // denom)
+                if n != last_n:
+                    sys.stderr.write("\r[" + "="*n + " "*(width-n) +
+                        "] {}/{}".format(num, denom))
+                    last_n = n
+            printer.send_gcode(args.gcode, progress_callback)
+            sys.stderr.write("\n")
+
+    except PrinterError as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
+
